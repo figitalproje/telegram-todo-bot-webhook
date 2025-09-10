@@ -1,4 +1,7 @@
 # bot_webhook.py (Webhook için sadeleştirilmiş)
+import logging
+logging.basicConfig(level=logging.INFO)
+
 import os, json, datetime, logging
 from typing import Dict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -88,12 +91,15 @@ def main():
     app.add_handler(CallbackQueryHandler(button))
 
     # PTB'nin kendi webhook runner'ını kullanıyoruz
-    app.run_webhook(
-        listen=HOST,
-        port=PORT,
-        secret_token=WEBHOOK_SECRET or None,
-        webhook_url=f"{PUBLIC_URL}/webhook"
-    )
+  app.run_webhook(
+    listen=HOST,
+    port=PORT,
+    webhook_url=f"{PUBLIC_URL}/webhook",
+    secret_token=WEBHOOK_SECRET or None,
+    url_path="webhook",          # <-- BUNU EKLE
+)
+
 
 if __name__=="__main__":
     main()
+
