@@ -1,15 +1,22 @@
-# bot_webhook.py — Telegram TODO botu
+# bot_webhook.py — Telegram TODO botu (PTB 21 + aiohttp)
 # Özellikler:
 #  - /gorev <metin>  → metnin sonuna otomatik oluşturulma zamanı ekler
 #  - ✅ butonuyla tamamlama
 #  - /list           → yapılacaklar & tamamlananlar
 #  - /clear          → SADECE tamamlananları siler (yapılacakları korur)
-#  - /inbox (HTTP POST) → WhatsApp/Zapier/Make tetiklerinden görev düşürür
+#  - /webhook (Telegram) → Telegram update alır
+#  - /inbox  (HTTP POST) → WhatsApp/Zapier/Make tetiklerinden görev düşürür
 #
-# Google Sheet: 'tasks' sayfasında başlıklar:
+# Google Sheet "tasks" başlıkları:
 #   chat_id | message_id | task | done | by | ts | owner | due | prio | created
+#
+# requirements.txt:
+#   python-telegram-bot[webhooks]==21.4
+#   gspread==6.1.4
+#   google-auth==2.34.0
+#   aiohttp==3.9.5
 
-import os, json, base64, logging
+import os, json, base64, logging, asyncio
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 
@@ -20,13 +27,13 @@ from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes
+    Application, ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 )
 
 # ---------- ENV ----------
 TOKEN = os.getenv("TOKEN", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # Telegram secret header için
 PORT = int(os.getenv("PORT", "10000"))
 HOST = "0.0.0.0"
 
@@ -35,8 +42,8 @@ GSHEET_KEY_JSON = os.getenv("GSHEET_KEY_JSON", "")
 GSHEET_KEY_B64 = os.getenv("GSHEET_KEY_B64", "")
 
 # WhatsApp/Zapier/Make için özel endpoint
-INBOX_SECRET = os.getenv("INBOX_SECRET", "")     # /inbox çağrılarında X-Secret ile gelecek
-DEFAULT_CHAT_ID = os.getenv("DEFAULT_CHAT_ID", "")  # opsiyonel: görevlerin düşeceği varsayılan grup id
+INBOX_SECRET = os.getenv("INBOX_SECRET", "")           # /inbox çağrılarında X-Secret
+DEFAULT_CHAT_ID = os.getenv("DEFAULT_CHAT_ID", "")     # opsiyonel: varsayılan grup id
 
 # ---------- Saat/Tarih ----------
 TZ_OFFSET = 3  # İstanbul için basit ofset
@@ -180,7 +187,6 @@ def sheet_clear_done(chat_id: int):
             cid = None
         done_flag = row[c_done-1].strip().lower() in ("1","true","evet","yes","x","✓")
 
-        # aynı chat'e ait ve tamamlanmışsa sil; diğerlerini koru
         if cid == int(chat_id) and done_flag:
             continue
         kept.append(row)
@@ -207,7 +213,6 @@ async def gorev(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Kullanım: /gorev <metin>")
         return
 
-    # Görev metnine oluşturulma zamanını ekle
     title_with_created = f"{raw} {created_now_str()}"
 
     sent = await update.message.reply_html(
@@ -216,7 +221,6 @@ async def gorev(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await sent.edit_reply_markup(reply_markup=kb(False, update.effective_chat.id, sent.message_id))
 
-    # Sheets'e kaydet (owner/due/prio şimdilik boş)
     sheet_insert_task(
         update.effective_chat.id,
         sent.message_id,
@@ -263,7 +267,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     by = q.from_user.full_name or (q.from_user.username and f"@{q.from_user.username}") or "birisi"
-    ts = _now().strftime("%d.%m.%Y %H:%M")
+    ts = created_now_str()
 
     task_title = sheet_mark_done(chat_id_i, msg_id_i, by, ts)
     if task_title is None:
@@ -276,9 +280,28 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb(True, chat_id_i, msg_id_i)
     )
 
-# ---------- HTTP /inbox (WhatsApp/Zapier/Make) ----------
-async def inbox_handler(request: web.Request):
-    # Güvenlik kontrolü (shared secret)
+# ---------- Aiohttp Web App (Telegram /webhook + /inbox) ----------
+async def telegram_webhook_handler(request: web.Request) -> web.Response:
+    # Telegram secret header kontrolü (opsiyonel ama önerilir)
+    if WEBHOOK_SECRET:
+        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+            return web.Response(status=403, text="forbidden")
+
+    try:
+        data = await request.json()
+    except Exception:
+        return web.Response(status=400, text="bad json")
+
+    app: Application = request.app["ptb_app"]
+    update = Update.de_json(data, app.bot)
+
+    # ÖNEMLİ: PTB 21'de doğrudan process_update çağırma.
+    # Kuyruğa at, Application zaten çalışıyor.
+    await app.update_queue.put(update)
+    return web.Response(text="ok")
+
+async def inbox_handler(request: web.Request) -> web.Response:
+    # Güvenlik: shared secret
     secret = request.headers.get("X-Secret", "")
     if not INBOX_SECRET or secret != INBOX_SECRET:
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
@@ -296,7 +319,6 @@ async def inbox_handler(request: web.Request):
     if not text:
         return web.json_response({"ok": False, "error": "missing text"}, status=400)
 
-    # Görev başlığı
     parts = [text]
     meta = []
     if customer: meta.append(customer)
@@ -306,15 +328,15 @@ async def inbox_handler(request: web.Request):
     parts.append(created_now_str())
     title = " ".join(parts)
 
-    # Hedef chat
-    target_env = (chat_id_override if chat_id_override is not None else DEFAULT_CHAT_ID).strip() if isinstance(DEFAULT_CHAT_ID, str) else chat_id_override
+    target = chat_id_override if chat_id_override is not None else DEFAULT_CHAT_ID
+    if isinstance(target, str):
+        target = target.strip()
     try:
-        target_chat_id = int(target_env)
+        target_chat_id = int(target)
     except Exception:
         return web.json_response({"ok": False, "error": "no chat_id (set DEFAULT_CHAT_ID env or pass chat_id)"},
                                  status=400)
 
-    # Telegram'a mesaj + buton
     ptb_app: Application = request.app["ptb_app"]
     sent = await ptb_app.bot.send_message(
         chat_id=target_chat_id,
@@ -329,7 +351,6 @@ async def inbox_handler(request: web.Request):
         reply_markup=kb(False, target_chat_id, sent.message_id)
     )
 
-    # Sheets’e yaz
     sheet_insert_task(
         target_chat_id,
         sent.message_id,
@@ -340,8 +361,8 @@ async def inbox_handler(request: web.Request):
 
     return web.json_response({"ok": True, "message_id": sent.message_id})
 
-# ---------- main ----------
-def main():
+# ---------- Main (async) ----------
+async def main_async():
     if not TOKEN:
         raise SystemExit("TOKEN env gerekli")
     if not PUBLIC_URL:
@@ -353,27 +374,47 @@ def main():
 
     logging.basicConfig(level=logging.INFO)
 
-    app = Application.builder().token(TOKEN).build()
+    # PTB Application
+    app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("gorev", gorev))
     app.add_handler(CommandHandler("todo", gorev))  # eski alışkanlık için kısayol
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(CallbackQueryHandler(button))
 
-    # Aiohttp uygulaması: /inbox endpoint’i
+    # PTB'yi initialize + start
+    await app.initialize()
+    await app.start()
+
+    # Telegram webhook'u ayarla
+    await app.bot.set_webhook(
+        url=f"{PUBLIC_URL}/webhook",
+        secret_token=WEBHOOK_SECRET or None
+    )
+
+    # Aiohttp server
     web_app = web.Application()
     web_app["ptb_app"] = app
+    web_app.router.add_post("/webhook", telegram_webhook_handler)
     web_app.router.add_post("/inbox", inbox_handler)
+    web_app.router.add_get("/", lambda _: web.Response(text="ok"))
 
-    # PTB webhook (Telegram) + bizim web_app birlikte
-    app.run_webhook(
-        listen=HOST,
-        port=PORT,
-        url_path="webhook",
-        webhook_url=f"{PUBLIC_URL}/webhook",
-        secret_token=WEBHOOK_SECRET or None,
-        web_app=web_app,  # <- bizim /inbox burada çalışıyor
-    )
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, HOST, PORT)
+    await site.start()
+    logging.info("Webhook server started on %s:%s", HOST, PORT)
+
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await app.stop()
+        await app.shutdown()
+        await runner.cleanup()
+
+def main():
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
