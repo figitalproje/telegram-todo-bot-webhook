@@ -62,17 +62,47 @@ def sheet_insert_task(chat_id: int, message_id: int, task: str):
     ws.append_row([str(chat_id), str(message_id), task, "0", "", ""], value_input_option="USER_ENTERED")
 
 def sheet_list_tasks(chat_id: int):
+    """
+    Sheets -> list of dicts (tipleri normalleştirerek) döndürür.
+    - chat_id: int'e normalize edilir (float -> int vb.)
+    - done: 1/true/evet gibi değerler True sayılır
+    """
     ws = _ws()
-    data = ws.get_all_records()
+    vals = ws.get_all_values()
+    if not vals:
+        return [], []
+
+    headers = [h.strip() for h in vals[0]]
+    rows = []
+    for row in vals[1:]:
+        # kısa satırlar için pad
+        row = row + [""] * (len(headers) - len(row))
+        rows.append({h: row[i] for i, h in enumerate(headers)})
+
+    def to_int_like(v):
+        try:
+            return int(float(str(v).strip()))
+        except Exception:
+            return None
+
+    target = to_int_like(chat_id)
+
+    def is_done(v) -> bool:
+        s = str(v).strip().lower()
+        return s in ("1", "true", "evet", "yes", "x", "✓")
+
     open_tasks, done_tasks = [], []
-    for r in data:
-        if str(r.get("chat_id")) != str(chat_id):
+    for r in rows:
+        cid = to_int_like(r.get("chat_id", ""))
+        if cid != target:
             continue
-        if str(r.get("done","0")) == "1":
+        if is_done(r.get("done", "0")):
             done_tasks.append(r)
         else:
             open_tasks.append(r)
+
     return open_tasks, done_tasks
+
 
 def sheet_mark_done(chat_id: int, message_id: int, by: str, ts: str) -> Optional[str]:
     ws = _ws()
@@ -201,3 +231,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
