@@ -1,14 +1,21 @@
-# bot_webhook.py — Telegram TODO botu (Google Sheets + oluşturulma zamanı)
-# Gereksinimler:
+# bot_webhook.py — Telegram TODO botu (Google Sheets + created timestamp)
+# Özellikler:
+#  - /gorev <metin>  → metnin sonuna otomatik oluşturulma zamanı ekler
+#  - ✅ butonuyla tamamlama
+#  - /list           → yapılacaklar & tamamlananlar
+#  - /clear          → SADECE tamamlananları siler (yapılacakları korur)
+#
+# Gereksinimler (requirements.txt):
 #   python-telegram-bot[webhooks]==21.4
 #   gspread==6.1.4
 #   google-auth==2.34.0
 #
-# ENV değişkenleri:
-#   TOKEN, PUBLIC_URL (https://... onrender.com), WEBHOOK_SECRET (opsiyonel),
+# Gerekli ENV:
+#   TOKEN, PUBLIC_URL (https://...onrender.com), WEBHOOK_SECRET (opsiyonel),
 #   GSHEET_ID, GSHEET_KEY_JSON (veya GSHEET_KEY_B64)
 #
-# Render'da port: 10000 (otomatik)
+# Google Sheet: 'tasks' adlı sayfada başlıklar:
+#   chat_id | message_id | task | done | by | ts | owner | due | prio | created
 
 import os, json, base64, logging
 from typing import Dict, List, Optional
@@ -34,18 +41,16 @@ GSHEET_ID = os.getenv("GSHEET_ID", "")
 GSHEET_KEY_JSON = os.getenv("GSHEET_KEY_JSON", "")
 GSHEET_KEY_B64 = os.getenv("GSHEET_KEY_B64", "")
 
-# ---------- Saat/Tarih yardımcıları ----------
-# İst/Ankara için basit +3 ofset (gerekirse değiştir)
-TZ_OFFSET = 3
+# ---------- Saat/Tarih ----------
+TZ_OFFSET = 3  # İstanbul için basit ofset
 
 def _now():
     return datetime.utcnow() + timedelta(hours=TZ_OFFSET)
 
 def created_now_str() -> str:
-    # Örn: 10.09.2025 14:30
     return _now().strftime("%d.%m.%Y %H:%M")
 
-# ---------- Google Sheets yardımcıları ----------
+# ---------- Google Sheets helpers ----------
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 def _load_sa_info() -> Dict:
@@ -74,7 +79,8 @@ def _ws():
     return ws
 
 def _headers(ws) -> List[str]:
-    return [h.strip() for h in (ws.get_all_values()[0] if ws.get_all_values() else [])]
+    vals = ws.get_all_values()
+    return [h.strip() for h in (vals[0] if vals else [])]
 
 def _col_idx(headers: List[str], name: str) -> int:
     """1-based column index; yoksa 0 döner."""
@@ -84,7 +90,7 @@ def _col_idx(headers: List[str], name: str) -> int:
             return i
     return 0
 
-# ---------- DB operasyonları (Sheets) ----------
+# ---------- DB (Sheets) ----------
 def sheet_insert_task(chat_id: int, message_id: int, task: str,
                       owner: Optional[str], due: Optional[str], prio: Optional[str],
                       created: str):
@@ -142,7 +148,6 @@ def sheet_mark_done(chat_id: int, message_id: int, by: str, ts: str) -> Optional
     if not all([c_chat, c_msg, c_task, c_done, c_by, c_ts]):
         return None
 
-    # satır bul
     for idx in range(2, len(vals)+1):
         row = vals[idx-1]
         def val(col): return (row[col-1] if len(row) >= col else "").strip()
@@ -159,20 +164,30 @@ def sheet_mark_done(chat_id: int, message_id: int, by: str, ts: str) -> Optional
             return task_text
     return None
 
-def sheet_clear_chat(chat_id: int):
+def sheet_clear_done(chat_id: int):
+    """Bu chat için SADECE tamamlanan görevleri siler."""
     ws = _ws()
     vals = ws.get_all_values()
     if not vals:
         return
-    headers = [vals[0]]
-    kept = [vals[0]]
+    headers = vals[0]
+    kept = [headers]
+
+    c_chat = _col_idx(headers, "chat_id")
+    c_done = _col_idx(headers, "done")
+
     for row in vals[1:]:
         try:
-            cid = int(float(row[0]))
+            cid = int(float(row[c_chat-1]))
         except:
             cid = None
-        if cid != int(chat_id):
-            kept.append(row)
+        done_flag = row[c_done-1].strip().lower() in ("1","true","evet","yes","x","✓")
+
+        # aynı chat'e ait ve tamamlanmışsa sil; diğerlerini koru
+        if cid == int(chat_id) and done_flag:
+            continue
+        kept.append(row)
+
     ws.clear()
     ws.update("A1", kept)
 
@@ -195,14 +210,13 @@ async def gorev(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Kullanım: /gorev <metin>")
         return
 
-    # İSTEK: oluşturulma tarih/saatinin metne eklenmesi
+    # Görev metnine oluşturulma zamanını ekle
     title_with_created = f"{raw} {created_now_str()}"
 
     sent = await update.message.reply_html(
         task_text(title_with_created, False, None, None),
         reply_markup=kb(False, update.effective_chat.id, 0)
     )
-    # doğru message_id ile butonu güncelle
     await sent.edit_reply_markup(reply_markup=kb(False, update.effective_chat.id, sent.message_id))
 
     # Sheets'e kaydet (owner/due/prio şimdilik boş)
@@ -221,8 +235,7 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     def line_open(r):
-        # r["task"] zaten oluşturulma saatini içeriyor; yine de
-        # ayrıca 'created' kolonu varsa sonuna eklemeyi istiyorsan:
+        # r["task"] zaten oluşturulma saatini içeriyor; ayrıca 'created' varsa
         created = r.get("created","")
         suffix = f" {created}" if created and created not in r.get("task","") else ""
         return f"📝 {r.get('task','')}{suffix}"
@@ -239,8 +252,8 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(text)
 
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sheet_clear_chat(update.effective_chat.id)
-    await update.message.reply_text("📋 Görev listesi temizlendi.")
+    sheet_clear_done(update.effective_chat.id)
+    await update.message.reply_text("🧹 Tamamlanan görevler silindi. Yapılacaklar duruyor.")
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -282,7 +295,7 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("gorev", gorev))
-    app.add_handler(CommandHandler("todo", gorev))  # alışkanlık için kısayol
+    app.add_handler(CommandHandler("todo", gorev))  # eski alışkanlık için kısayol
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(CallbackQueryHandler(button))
