@@ -1,20 +1,12 @@
-# bot_webhook.py — Telegram TODO botu (Google Sheets + created timestamp)
+# bot_webhook.py — Telegram TODO botu
 # Özellikler:
 #  - /gorev <metin>  → metnin sonuna otomatik oluşturulma zamanı ekler
 #  - ✅ butonuyla tamamlama
 #  - /list           → yapılacaklar & tamamlananlar
 #  - /clear          → SADECE tamamlananları siler (yapılacakları korur)
+#  - /inbox (HTTP POST) → WhatsApp/Zapier/Make tetiklerinden görev düşürür
 #
-# Gereksinimler (requirements.txt):
-#   python-telegram-bot[webhooks]==21.4
-#   gspread==6.1.4
-#   google-auth==2.34.0
-#
-# Gerekli ENV:
-#   TOKEN, PUBLIC_URL (https://...onrender.com), WEBHOOK_SECRET (opsiyonel),
-#   GSHEET_ID, GSHEET_KEY_JSON (veya GSHEET_KEY_B64)
-#
-# Google Sheet: 'tasks' adlı sayfada başlıklar:
+# Google Sheet: 'tasks' sayfasında başlıklar:
 #   chat_id | message_id | task | done | by | ts | owner | due | prio | created
 
 import os, json, base64, logging
@@ -23,6 +15,7 @@ from datetime import datetime, timedelta
 
 import gspread
 from google.oauth2.service_account import Credentials
+from aiohttp import web
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -40,6 +33,10 @@ HOST = "0.0.0.0"
 GSHEET_ID = os.getenv("GSHEET_ID", "")
 GSHEET_KEY_JSON = os.getenv("GSHEET_KEY_JSON", "")
 GSHEET_KEY_B64 = os.getenv("GSHEET_KEY_B64", "")
+
+# WhatsApp/Zapier/Make için özel endpoint
+INBOX_SECRET = os.getenv("INBOX_SECRET", "")     # /inbox çağrılarında X-Secret ile gelecek
+DEFAULT_CHAT_ID = os.getenv("DEFAULT_CHAT_ID", "")  # opsiyonel: görevlerin düşeceği varsayılan grup id
 
 # ---------- Saat/Tarih ----------
 TZ_OFFSET = 3  # İstanbul için basit ofset
@@ -203,7 +200,7 @@ def kb(done: bool, chat_id: int, message_id: int) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Tamamlandı", callback_data="noop")]])
     return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Tamamla", callback_data=f"done|{chat_id}|{message_id}")]])
 
-# ---------- Handlers ----------
+# ---------- Telegram Handlers ----------
 async def gorev(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = " ".join(context.args).strip()
     if not raw:
@@ -235,7 +232,6 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     def line_open(r):
-        # r["task"] zaten oluşturulma saatini içeriyor; ayrıca 'created' varsa
         created = r.get("created","")
         suffix = f" {created}" if created and created not in r.get("task","") else ""
         return f"📝 {r.get('task','')}{suffix}"
@@ -280,6 +276,70 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb(True, chat_id_i, msg_id_i)
     )
 
+# ---------- HTTP /inbox (WhatsApp/Zapier/Make) ----------
+async def inbox_handler(request: web.Request):
+    # Güvenlik kontrolü (shared secret)
+    secret = request.headers.get("X-Secret", "")
+    if not INBOX_SECRET or secret != INBOX_SECRET:
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+    text = str(payload.get("text", "")).strip()
+    customer = str(payload.get("customer", "")).strip()
+    phone = str(payload.get("phone", "")).strip()
+    chat_id_override = payload.get("chat_id", None)
+
+    if not text:
+        return web.json_response({"ok": False, "error": "missing text"}, status=400)
+
+    # Görev başlığı
+    parts = [text]
+    meta = []
+    if customer: meta.append(customer)
+    if phone:    meta.append(phone)
+    if meta:
+        parts.append("— " + " • ".join(meta))
+    parts.append(created_now_str())
+    title = " ".join(parts)
+
+    # Hedef chat
+    target_env = (chat_id_override if chat_id_override is not None else DEFAULT_CHAT_ID).strip() if isinstance(DEFAULT_CHAT_ID, str) else chat_id_override
+    try:
+        target_chat_id = int(target_env)
+    except Exception:
+        return web.json_response({"ok": False, "error": "no chat_id (set DEFAULT_CHAT_ID env or pass chat_id)"},
+                                 status=400)
+
+    # Telegram'a mesaj + buton
+    ptb_app: Application = request.app["ptb_app"]
+    sent = await ptb_app.bot.send_message(
+        chat_id=target_chat_id,
+        text=task_text(title, False, None, None),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Tamamla", callback_data=f"done|{target_chat_id}|0")]])
+    )
+    # doğru message_id ile inline keyboard’u güncelle
+    await ptb_app.bot.edit_message_reply_markup(
+        chat_id=target_chat_id,
+        message_id=sent.message_id,
+        reply_markup=kb(False, target_chat_id, sent.message_id)
+    )
+
+    # Sheets’e yaz
+    sheet_insert_task(
+        target_chat_id,
+        sent.message_id,
+        title,
+        owner=None, due=None, prio=None,
+        created=created_now_str()
+    )
+
+    return web.json_response({"ok": True, "message_id": sent.message_id})
+
 # ---------- main ----------
 def main():
     if not TOKEN:
@@ -300,12 +360,19 @@ def main():
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(CallbackQueryHandler(button))
 
+    # Aiohttp uygulaması: /inbox endpoint’i
+    web_app = web.Application()
+    web_app["ptb_app"] = app
+    web_app.router.add_post("/inbox", inbox_handler)
+
+    # PTB webhook (Telegram) + bizim web_app birlikte
     app.run_webhook(
         listen=HOST,
         port=PORT,
         url_path="webhook",
         webhook_url=f"{PUBLIC_URL}/webhook",
         secret_token=WEBHOOK_SECRET or None,
+        web_app=web_app,  # <- bizim /inbox burada çalışıyor
     )
 
 if __name__ == "__main__":
