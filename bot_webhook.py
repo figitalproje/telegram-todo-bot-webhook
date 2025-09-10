@@ -1,420 +1,373 @@
-# bot_webhook.py — Telegram TODO botu (PTB 21 + aiohttp)
-# Özellikler:
-#  - /gorev <metin>  → metnin sonuna otomatik oluşturulma zamanı ekler
-#  - ✅ butonuyla tamamlama
-#  - /list           → yapılacaklar & tamamlananlar
-#  - /clear          → SADECE tamamlananları siler (yapılacakları korur)
-#  - /webhook (Telegram) → Telegram update alır
-#  - /inbox  (HTTP POST) → WhatsApp/Zapier/Make tetiklerinden görev düşürür
-#
-# Google Sheet "tasks" başlıkları:
-#   chat_id | message_id | task | done | by | ts | owner | due | prio | created
-#
-# requirements.txt:
-#   python-telegram-bot[webhooks]==21.4
-#   gspread==6.1.4
-#   google-auth==2.34.0
-#   aiohttp==3.9.5
+# -*- coding: utf-8 -*-
+# Telegram grup İŞİ/TODO botu + Webhook /inbox entegrasyonu (PTB 21.x)
+# Özellikler: /gorev, Tamamla butonu, /list, /clear(yalnızca tamamlananları siler), /inbox HTTP
+# Opsiyonel: Google Sheets’e yaz (GSHEET_ID + GOOGLE_APPLICATION_CREDENTIALS varsa)
 
-import os, json, base64, logging, asyncio
-from typing import Dict, List, Optional
-from datetime import datetime, timedelta
+import os, json, datetime, logging, asyncio
+from typing import Dict, Tuple, Optional
 
-import gspread
-from google.oauth2.service_account import Credentials
 from aiohttp import web
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
 
-# ---------- ENV ----------
+# ---- Logging ----
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("todo-bot")
+
+# ---- ENV ----
 TOKEN = os.getenv("TOKEN", "")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # Telegram secret header için
-PORT = int(os.getenv("PORT", "10000"))
-HOST = "0.0.0.0"
+PUBLIC_URL = os.getenv("PUBLIC_URL", "")
+INBOX_SECRET = os.getenv("INBOX_SECRET", "")
+DEFAULT_CHAT_ID = int(os.getenv("DEFAULT_CHAT_ID", "0"))
 
 GSHEET_ID = os.getenv("GSHEET_ID", "")
-GSHEET_KEY_JSON = os.getenv("GSHEET_KEY_JSON", "")
-GSHEET_KEY_B64 = os.getenv("GSHEET_KEY_B64", "")
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 
-# WhatsApp/Zapier/Make için özel endpoint
-INBOX_SECRET = os.getenv("INBOX_SECRET", "")           # /inbox çağrılarında X-Secret
-DEFAULT_CHAT_ID = os.getenv("DEFAULT_CHAT_ID", "")     # opsiyonel: varsayılan grup id
+# ---- Basit JSON DB ----
+DATA_FILE = "tasks.json"
 
-# ---------- Saat/Tarih ----------
-TZ_OFFSET = 3  # İstanbul için basit ofset
 
-def _now():
-    return datetime.utcnow() + timedelta(hours=TZ_OFFSET)
+def load_db() -> Dict:
+    if not os.path.exists(DATA_FILE):
+        return {}
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-def created_now_str() -> str:
-    return _now().strftime("%d.%m.%Y %H:%M")
 
-# ---------- Google Sheets helpers ----------
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+def save_db(db: Dict) -> None:
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
 
-def _load_sa_info() -> Dict:
-    if GSHEET_KEY_JSON:
-        return json.loads(GSHEET_KEY_JSON)
-    if GSHEET_KEY_B64:
-        return json.loads(base64.b64decode(GSHEET_KEY_B64).decode("utf-8"))
-    raise SystemExit("Google Sheets anahtarı yok. GSHEET_KEY_JSON veya GSHEET_KEY_B64 ekleyin.")
 
-def _gc() -> gspread.Client:
-    creds = Credentials.from_service_account_info(_load_sa_info(), scopes=SCOPES)
-    return gspread.authorize(creds)
+def key_for(chat_id: int, msg_id: int) -> str:
+    return f"{chat_id}:{msg_id}"
 
-def _ws():
-    """tasks sayfasını döndür; yoksa oluştur ve başlıkları yaz."""
-    if not GSHEET_ID:
-        raise SystemExit("GSHEET_ID env gerekli.")
-    sh = _gc().open_by_key(GSHEET_ID)
+
+# ---- Metin/Buton yardımcıları ----
+def task_text(title: str, done: bool, by: Optional[str], ts: Optional[str]) -> str:
+    """Görev mesajı gövdesi (HTML)."""
+    if done:
+        meta = f"✅ Tamamlandı — {ts} · {by}"
+        return f"<b>✅ Tamamlananlar</b>\n<code>{title}</code>\n<i>{meta}</i>"
+    else:
+        return f"<b>🟢 Yapılacaklar</b>\n<code>{title}</code>"
+
+
+def keyboard(done: bool, chat_id: int, msg_id: int) -> InlineKeyboardMarkup:
+    if done:
+        # İstersen burada 'Geri Al' butonu da koyabilirsin; şimdilik kapalı.
+        return InlineKeyboardMarkup.from_row(
+            [InlineKeyboardButton("↩️ Geri Al (yakında)", callback_data="noop")]
+        )
+    else:
+        return InlineKeyboardMarkup.from_row(
+            [InlineKeyboardButton("✅ Tamamla", callback_data=f"done|{chat_id}|{msg_id}")]
+        )
+
+
+def now_str() -> str:
+    return datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+
+
+def user_name(u) -> str:
+    return u.full_name or (u.username and f"@{u.username}") or "birisi"
+
+
+def make_title_with_ts(raw: str) -> str:
+    base = raw.strip()
+    ts = now_str()
+    return f"{base} — {ts}"
+
+
+# ---- Google Sheets (opsiyonel, varsa çalışır) ----
+def _sheet_client_or_none():
+    if not GSHEET_ID or not GOOGLE_APPLICATION_CREDENTIALS:
+        return None
     try:
-        ws = sh.worksheet("tasks")
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title="tasks", rows=200, cols=10)
-        ws.update("A1:J1", [[
-            "chat_id","message_id","task","done","by","ts","owner","due","prio","created"
-        ]])
-    return ws
-
-def _headers(ws) -> List[str]:
-    vals = ws.get_all_values()
-    return [h.strip() for h in (vals[0] if vals else [])]
-
-def _col_idx(headers: List[str], name: str) -> int:
-    """1-based column index; yoksa 0 döner."""
-    name = name.strip().lower()
-    for i, h in enumerate(headers, start=1):
-        if h.strip().lower() == name:
-            return i
-    return 0
-
-# ---------- DB (Sheets) ----------
-def sheet_insert_task(chat_id: int, message_id: int, task: str,
-                      owner: Optional[str], due: Optional[str], prio: Optional[str],
-                      created: str):
-    ws = _ws()
-    ws.append_row(
-        [str(chat_id), str(message_id), task, "0", "", "", owner or "", due or "", prio or "", created],
-        value_input_option="USER_ENTERED"
-    )
-
-def sheet_list_tasks(chat_id: int):
-    """Tipleri normalize ederek bu chat'e ait açık/tamam görevleri döndürür."""
-    ws = _ws()
-    vals = ws.get_all_values()
-    if not vals:
-        return [], []
-    headers = [h.strip() for h in vals[0]]
-
-    def row_to_dict(row):
-        row = row + [""] * (len(headers) - len(row))
-        return {headers[i]: row[i] for i in range(len(headers))}
-
-    def to_int_like(v):
-        try: return int(float(str(v).strip()))
-        except: return None
-
-    def is_done(v) -> bool:
-        s = str(v).strip().lower()
-        return s in ("1","true","evet","yes","x","✓")
-
-    target = to_int_like(chat_id)
-    open_tasks, done_tasks = [], []
-    for rvals in vals[1:]:
-        r = row_to_dict(rvals)
-        if to_int_like(r.get("chat_id","")) != target:
-            continue
-        if is_done(r.get("done","0")):
-            done_tasks.append(r)
-        else:
-            open_tasks.append(r)
-    return open_tasks, done_tasks
-
-def sheet_mark_done(chat_id: int, message_id: int, by: str, ts: str) -> Optional[str]:
-    ws = _ws()
-    vals = ws.get_all_values()
-    if not vals:
-        return None
-    headers = [h.strip() for h in vals[0]]
-    c_chat   = _col_idx(headers, "chat_id")
-    c_msg    = _col_idx(headers, "message_id")
-    c_task   = _col_idx(headers, "task")
-    c_done   = _col_idx(headers, "done")
-    c_by     = _col_idx(headers, "by")
-    c_ts     = _col_idx(headers, "ts")
-
-    if not all([c_chat, c_msg, c_task, c_done, c_by, c_ts]):
+        import gspread
+        # service account dosya yolu env’de verilmeli
+        gc = gspread.service_account(filename=GOOGLE_APPLICATION_CREDENTIALS)
+        sh = gc.open_by_key(GSHEET_ID)
+        try:
+            ws = sh.worksheet("Tasks")
+        except Exception:
+            ws = sh.add_worksheet(title="Tasks", rows=1000, cols=10)
+            ws.append_row(["chat_id", "message_id", "title", "status", "by", "when"], value_input_option="RAW")
+        return ws
+    except Exception:
+        log.exception("Google Sheets bağlantı hatası")
         return None
 
-    for idx in range(2, len(vals)+1):
-        row = vals[idx-1]
-        def val(col): return (row[col-1] if len(row) >= col else "").strip()
-        try:
-            cid = int(float(val(c_chat)))
-            mid = int(float(val(c_msg)))
-        except:
-            continue
-        if cid == chat_id and mid == message_id:
-            task_text = val(c_task)
-            ws.update_cell(idx, c_done, "1")
-            ws.update_cell(idx, c_by, by)
-            ws.update_cell(idx, c_ts, ts)
-            return task_text
-    return None
 
-def sheet_clear_done(chat_id: int):
-    """Bu chat için SADECE tamamlanan görevleri siler."""
-    ws = _ws()
-    vals = ws.get_all_values()
-    if not vals:
+def sheet_append(chat_id: int, msg_id: int, title: str, by: str, when: str, status: str = "New"):
+    ws = _sheet_client_or_none()
+    if not ws:
         return
-    headers = vals[0]
-    kept = [headers]
+    try:
+        ws.append_row([chat_id, msg_id, title, status, by, when], value_input_option="RAW")
+    except Exception:
+        log.exception("sheet_append hata")
 
-    c_chat = _col_idx(headers, "chat_id")
-    c_done = _col_idx(headers, "done")
 
-    for row in vals[1:]:
-        try:
-            cid = int(float(row[c_chat-1]))
-        except:
-            cid = None
-        done_flag = row[c_done-1].strip().lower() in ("1","true","evet","yes","x","✓")
-
-        if cid == int(chat_id) and done_flag:
-            continue
-        kept.append(row)
-
-    ws.clear()
-    ws.update("A1", kept)
-
-# ---------- UI ----------
-def task_text(task: str, done: bool, by: Optional[str], ts: Optional[str]) -> str:
-    if done:
-        meta = f"\n\n✅ <b>Tamamlandı</b> {ts} • {by}"
-        return f"<s>{task}</s>{meta}"
-    return f"📝 <b>Görev</b>\n{task}"
-
-def kb(done: bool, chat_id: int, message_id: int) -> InlineKeyboardMarkup:
-    if done:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Tamamlandı", callback_data="noop")]])
-    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Tamamla", callback_data=f"done|{chat_id}|{message_id}")]])
-
-# ---------- Telegram Handlers ----------
-async def gorev(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = " ".join(context.args).strip()
-    if not raw:
-        await update.message.reply_text("Kullanım: /gorev <metin>")
+def sheet_mark_done(chat_id: int, msg_id: int, by: str, when: str):
+    ws = _sheet_client_or_none()
+    if not ws:
         return
+    try:
+        # message_id eşleşen satırı bulup status/by/when güncelleyelim
+        cells = ws.col_values(2)  # message_id kolonu
+        for idx, v in enumerate(cells, start=1):
+            if str(v).strip() == str(msg_id):
+                ws.update_cell(idx, 4, "Done")  # status
+                ws.update_cell(idx, 5, by)      # by
+                ws.update_cell(idx, 6, when)    # when
+                break
+    except Exception:
+        log.exception("sheet_mark_done hata")
 
-    title_with_created = f"{raw} {created_now_str()}"
 
-    sent = await update.message.reply_html(
-        task_text(title_with_created, False, None, None),
-        reply_markup=kb(False, update.effective_chat.id, 0)
-    )
-    await sent.edit_reply_markup(reply_markup=kb(False, update.effective_chat.id, sent.message_id))
+# ---- /inbox için yardımcı ----
+def create_task_message_for_inbox(chat_id: int, raw_text: str, by: str = "Webhook") -> Tuple[str, InlineKeyboardMarkup]:
+    title = raw_text.strip()
+    if not title.lower().startswith(("siparis", "sipariş")):
+        title = f"SİPARİŞ: {title}"
+    title = make_title_with_ts(title)
+    txt = task_text(title, done=False, by=None, ts=None)
+    kb = keyboard(False, chat_id, 0)  # msg_id burada placeholder; edit ederken gerekmiyor
+    return txt, kb
 
-    sheet_insert_task(
-        update.effective_chat.id,
-        sent.message_id,
-        title_with_created,
-        owner=None, due=None, prio=None,
-        created=created_now_str()
+
+# ---- Telegram handlers ----
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_html(
+        "Merhaba! 👋\n"
+        "Yeni görev: <code>/gorev Görev başlığı</code>\n"
+        "Liste: <code>/list</code>\n"
+        "Temizle (yalnızca tamamlananlar): <code>/clear</code>"
     )
 
-async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    open_tasks, done_tasks = sheet_list_tasks(update.effective_chat.id)
-    if not open_tasks and not done_tasks:
-        await update.message.reply_text("Şu an hiç görev yok.")
+
+async def cmd_gorev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Kullanım: /gorev Görev başlığı")
         return
+    chat_id = update.effective_chat.id
+    title = " ".join(context.args).strip()
+    title = make_title_with_ts(title)
 
-    def line_open(r):
-        created = r.get("created","")
-        suffix = f" {created}" if created and created not in r.get("task","") else ""
-        return f"📝 {r.get('task','')}{suffix}"
+    txt = task_text(title, done=False, by=None, ts=None)
+    sent = await update.message.reply_html(txt, reply_markup=keyboard(False, chat_id, update.message.id))
+    # DB’ye yaz
+    db = load_db()
+    db[key_for(chat_id, sent.message_id)] = {
+        "title": title,
+        "done": False,
+        "by": None,
+        "ts": None,
+    }
+    save_db(db)
 
-    def line_done(r):
-        return f"✅ {r.get('task','')} — {r.get('by','')} ({r.get('ts','')})"
+    # Sheets
+    sheet_append(chat_id, sent.message_id, title, by=user_name(update.effective_user), when=now_str(), status="New")
 
-    text = ""
-    if open_tasks:
-        text += "<b>🟢 Yapılacaklar</b>\n" + "\n".join(map(line_open, open_tasks)) + "\n\n"
-    if done_tasks:
-        text += "<b>⚪ Tamamlananlar</b>\n" + "\n".join(map(line_done, done_tasks))
 
-    await update.message.reply_html(text)
-
-async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sheet_clear_done(update.effective_chat.id)
-    await update.message.reply_text("🧹 Tamamlanan görevler silindi. Yapılacaklar duruyor.")
-
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cb_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if q.data == "noop":
-        return
     try:
-        _, chat_id, msg_id = q.data.split("|", 2)
-        chat_id_i, msg_id_i = int(chat_id), int(msg_id)
+        _, ch, mid = q.data.split("|", 2)
+        chat_id, msg_id = int(ch), int(mid)
     except Exception:
         return
 
-    by = q.from_user.full_name or (q.from_user.username and f"@{q.from_user.username}") or "birisi"
-    ts = created_now_str()
-
-    task_title = sheet_mark_done(chat_id_i, msg_id_i, by, ts)
-    if task_title is None:
-        return
+    db = load_db()
+    rec = db.get(key_for(chat_id, msg_id))
+    if not rec:
+        # eski kayıt yoksa sadece görsel güncelle
+        rec = {"title": "(başlık bulunamadı)", "done": True, "by": user_name(q.from_user), "ts": now_str()}
+    else:
+        rec["done"] = True
+        rec["by"] = user_name(q.from_user)
+        rec["ts"] = now_str()
+    save_db(db)
 
     await context.bot.edit_message_text(
-        chat_id=chat_id_i, message_id=msg_id_i,
-        text=task_text(task_title, True, by, ts),
+        chat_id=chat_id,
+        message_id=msg_id,
+        text=task_text(rec["title"], done=True, by=rec["by"], ts=rec["ts"]),
         parse_mode=ParseMode.HTML,
-        reply_markup=kb(True, chat_id_i, msg_id_i)
+        reply_markup=keyboard(True, chat_id, msg_id),
     )
 
-# ---------- Aiohttp Web App (Telegram /webhook + /inbox) ----------
-async def telegram_webhook_handler(request: web.Request) -> web.Response:
-    # Telegram secret header kontrolü (opsiyonel ama önerilir)
-    if WEBHOOK_SECRET:
-        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-            return web.Response(status=403, text="forbidden")
+    # Sheets
+    sheet_mark_done(chat_id, msg_id, by=rec["by"], when=rec["ts"])
 
-    try:
-        data = await request.json()
-    except Exception:
-        return web.Response(status=400, text="bad json")
 
-    app: Application = request.app["ptb_app"]
-    update = Update.de_json(data, app.bot)
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    db = load_db()
 
-    # ÖNEMLİ: PTB 21'de doğrudan process_update çağırma.
-    # Kuyruğa at, Application zaten çalışıyor.
-    await app.update_queue.put(update)
-    return web.Response(text="ok")
+    todos, dones = [], []
+    for k, v in db.items():
+        try:
+            ch, _ = k.split(":")
+            if int(ch) != chat_id:
+                continue
+        except Exception:
+            continue
+        if v.get("done"):
+            meta = f"{v.get('by') or ''} — {v.get('ts') or ''}".strip(" —")
+            dones.append(f"{v.get('title')}  ({meta})" if meta else v.get("title"))
+        else:
+            todos.append(v.get("title"))
 
-async def inbox_handler(request: web.Request) -> web.Response:
-    # Güvenlik: shared secret
-    secret = request.headers.get("X-Secret", "")
-    if not INBOX_SECRET or secret != INBOX_SECRET:
+    lines = []
+    lines.append("🟢 <b>Yapılacaklar</b>")
+    lines.extend([f"• {t}" for t in todos]) if todos else lines.append("— yok —")
+    lines.append("")
+    lines.append("✅ <b>Tamamlananlar</b>")
+    lines.extend([f"• {d}" for d in dones]) if dones else lines.append("— yok —")
+
+    await update.message.reply_html("\n".join(lines))
+
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sadece tamamlanan kayıtları siler."""
+    chat_id = update.effective_chat.id
+    db = load_db()
+    before = len(db)
+    keep = {}
+    for k, v in db.items():
+        try:
+            ch, _ = k.split(":")
+            if int(ch) != chat_id:
+                keep[k] = v
+                continue
+        except Exception:
+            keep[k] = v
+            continue
+        if not v.get("done"):  # yapılacak olanları koru
+            keep[k] = v
+    save_db(keep)
+    deleted = before - len(keep)
+    await update.message.reply_text(f"✅ {deleted} tamamlanmış görev temizlendi.")
+
+
+# ---- AIOHTTP /inbox route ----
+# Bu route’u, PTB’nin webhook sunucusuna (aynı uygulama) ekleyeceğiz.
+routes = web.RouteTableDef()
+_app_for_routes: Optional[Application] = None  # run_webhook sonrası atanır
+
+
+@routes.post("/inbox")
+async def inbox(request: web.Request):
+    # Güvenlik
+    secret = request.headers.get("X-Secret")
+    if not secret or secret != INBOX_SECRET:
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
 
     try:
-        payload = await request.json()
+        body = await request.json()
     except Exception:
         return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
 
-    text = str(payload.get("text", "")).strip()
-    customer = str(payload.get("customer", "")).strip()
-    phone = str(payload.get("phone", "")).strip()
-    chat_id_override = payload.get("chat_id", None)
+    raw_text = (body.get("text") or "").strip()
+    if not raw_text:
+        return web.json_response({"ok": False, "error": "text_required"}, status=400)
 
-    if not text:
-        return web.json_response({"ok": False, "error": "missing text"}, status=400)
+    chat_id = int(body.get("chat_id") or DEFAULT_CHAT_ID or 0)
+    if not chat_id:
+        return web.json_response({"ok": False, "error": "chat_id_required"}, status=400)
 
-    parts = [text]
-    meta = []
-    if customer: meta.append(customer)
-    if phone:    meta.append(phone)
-    if meta:
-        parts.append("— " + " • ".join(meta))
-    parts.append(created_now_str())
-    title = " ".join(parts)
-
-    target = chat_id_override if chat_id_override is not None else DEFAULT_CHAT_ID
-    if isinstance(target, str):
-        target = target.strip()
-    try:
-        target_chat_id = int(target)
-    except Exception:
-        return web.json_response({"ok": False, "error": "no chat_id (set DEFAULT_CHAT_ID env or pass chat_id)"},
-                                 status=400)
-
-    ptb_app: Application = request.app["ptb_app"]
-    sent = await ptb_app.bot.send_message(
-        chat_id=target_chat_id,
-        text=task_text(title, False, None, None),
+    # Mesajı görev olarak gönder
+    txt, kb = create_task_message_for_inbox(chat_id, raw_text, by="Webhook")
+    out = await _app_for_routes.bot.send_message(
+        chat_id=chat_id,
+        text=txt,
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Tamamla", callback_data=f"done|{target_chat_id}|0")]])
-    )
-    # doğru message_id ile inline keyboard’u güncelle
-    await ptb_app.bot.edit_message_reply_markup(
-        chat_id=target_chat_id,
-        message_id=sent.message_id,
-        reply_markup=kb(False, target_chat_id, sent.message_id)
+        reply_markup=kb,
+        disable_web_page_preview=True,
     )
 
-    sheet_insert_task(
-        target_chat_id,
-        sent.message_id,
-        title,
-        owner=None, due=None, prio=None,
-        created=created_now_str()
-    )
+    # DB’ye yaz
+    db = load_db()
+    db[key_for(chat_id, out.message_id)] = {
+        "title": raw_text if raw_text else "(sipariş)",
+        "done": False,
+        "by": None,
+        "ts": None,
+    }
+    save_db(db)
 
-    return web.json_response({"ok": True, "message_id": sent.message_id})
+    # Sheets (opsiyonel)
+    try:
+        sheet_append(chat_id, out.message_id, raw_text, by="Webhook", when=now_str(), status="New")
+    except Exception:
+        log.exception("sheet_append (inbox) failed")
 
-# ---------- Main (async) ----------
-async def main_async():
+    return web.json_response({"ok": True, "message_id": out.message_id})
+
+
+# ---- PTB init & webhook ----
+async def post_init(application: Application) -> None:
+    """run_webhook sırasında, PTB'nin kendi web_app'ine /inbox route'unu ekliyoruz."""
+    global _app_for_routes
+    _app_for_routes = application
+    # PTB 21.x: application.web_app özelliği run_webhook içinde oluşturulur, post_init’te erişilebilir.
+    application.web_app.add_routes(routes)
+    log.info("Custom route '/inbox' eklendi.")
+
+
+def main():
     if not TOKEN:
         raise SystemExit("TOKEN env gerekli")
     if not PUBLIC_URL:
-        raise SystemExit("PUBLIC_URL env gerekli (https://...)")
-    if not GSHEET_ID:
-        raise SystemExit("GSHEET_ID env gerekli")
-    if not (GSHEET_KEY_JSON or GSHEET_KEY_B64):
-        raise SystemExit("GSHEET_KEY_JSON veya GSHEET_KEY_B64 env gerekli")
+        raise SystemExit("PUBLIC_URL env gerekli (https://...)" )
+    if not INBOX_SECRET:
+        log.warning("INBOX_SECRET tanımlı değil; /inbox güvenliği yok!")
 
-    logging.basicConfig(level=logging.INFO)
-
-    # PTB Application
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("gorev", gorev))
-    app.add_handler(CommandHandler("todo", gorev))  # eski alışkanlık için kısayol
-    app.add_handler(CommandHandler("list", list_cmd))
-    app.add_handler(CommandHandler("clear", clear_cmd))
-    app.add_handler(CallbackQueryHandler(button))
-
-    # PTB'yi initialize + start
-    await app.initialize()
-    await app.start()
-
-    # Telegram webhook'u ayarla
-    await app.bot.set_webhook(
-        url=f"{PUBLIC_URL}/webhook",
-        secret_token=WEBHOOK_SECRET or None
+    app: Application = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .post_init(post_init)  # <- /inbox route burada eklenir
+        .build()
     )
 
-    # Aiohttp server
-    web_app = web.Application()
-    web_app["ptb_app"] = app
-    web_app.router.add_post("/webhook", telegram_webhook_handler)
-    web_app.router.add_post("/inbox", inbox_handler)
-    web_app.router.add_get("/", lambda _: web.Response(text="ok"))
+    # Komutlar
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("gorev", cmd_gorev))
+    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CallbackQueryHandler(cb_done, pattern=r"^done\|"))
+    app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern=r"^noop$"))
+    # (İstemezseniz serbest mesaj yakalama kapalı)
 
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, HOST, PORT)
-    await site.start()
-    logging.info("Webhook server started on %s:%s", HOST, PORT)
+    # Webhook’u PTB üzerinden ayağa kaldır
+    # Render tek port açar; PTB kendi aiohttp web sunucusunu başlatır ve biz de post_init’te /inbox ekledik.
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.getenv("PORT", "10000")),
+        url_path="",  # kök
+        webhook_url=f"{PUBLIC_URL}",
+        secret_token=None,  # Telegram secret token kullanmıyoruz
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    finally:
-        await app.stop()
-        await app.shutdown()
-        await runner.cleanup()
-
-def main():
-    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
